@@ -1,0 +1,131 @@
+# =====================================================================
+# LABORATÓRIO DE DATA LAKEHOUSE
+# =====================================================================
+# Sobe um lakehouse simples e pré-conectado — só armazenamento (MinIO) e
+# Jupyter com pandas puro (sem pacote nenhum pré-instalado além das libs
+# padrão), para manter o foco didático na arquitetura medalhão
+# (bronze -> silver -> gold) sem depender de motor de SQL nenhum:
+#
+#   MinIO (armazenamento S3-compatível) -- é a ÚNICA peça de
+#   armazenamento/estado deste laboratório.
+#
+#   Jupyter (pandas + s3fs, lendo/escrevendo direto no MinIO via
+#   storage_options) -- bronze, silver e gold nascem todas VAZIAS (só a
+#   "pasta" existe, criada pelo minio-init). Não tem pipeline nenhum
+#   rodando sozinho: tudo que existir em bronze/silver/gold é o que o
+#   aluno construiu numa célula do único notebook deste laboratório --
+#   ver `jupyter/notebooks/investigacao.ipynb` -- tudo com pandas, sem
+#   SQL nenhum.
+#
+# Para o aluno, o único comando necessário é:
+#   docker compose up -d
+#
+# URLs depois de subir (nenhuma pede credencial do aluno, exceto o
+# Console do MinIO -- limitação do próprio MinIO, ver README):
+#   Jupyter -> http://localhost:8888  (sem login)
+#   MinIO   -> http://localhost:9001  (console web, login: ver .env)
+# =====================================================================
+
+services:
+  # -------------------------------------------------------------
+  # MINIO — armazenamento de objetos S3-compatível. As camadas
+  # bronze/silver/gold são pastas (prefixos) dentro de um único bucket
+  # "lakehouse" — é a ÚNICA peça de armazenamento/estado deste
+  # laboratório.
+  # -------------------------------------------------------------
+  minio:
+    image: quay.io/minio/minio@sha256:14cea493d9a34af32f524e538b8346cf79f3321eff8e708c1e2960462bd8936e
+    # Pinada numa release recente, de propósito SEM o Console clássico de
+    # administração (a MinIO removeu ações administrativas do Console
+    # open-source em 2025 e empurrou pra versão paga, AIStor). Não faz
+    # falta aqui: toda ação administrativa deste projeto já roda via
+    # `mc` (minio-init) ou é só leitura (ver bronze/silver/gold pelo
+    # Console). Ver README para o histórico dessa mudança.
+    container_name: data_lakehouse_101-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"   # API S3
+      - "9001:9001"   # Console web
+    volumes:
+      - minio-data:/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # -------------------------------------------------------------
+  # MINIO-INIT — tarefa única: cria o bucket e as "pastas" bronze,
+  # silver e gold para já nascerem visíveis no console — todas vazias;
+  # nada aqui constrói dado nenhum, é só estrutura.
+  # -------------------------------------------------------------
+  minio-init:
+    image: quay.io/minio/mc@sha256:a7fe349ef4bd8521fb8497f55c6042871b2ae640607cf99d9bede5e9bdf11727
+    container_name: data_lakehouse_101-minio-init
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: /bin/sh /scripts/minio-init.sh
+    volumes:
+      - ./scripts/minio-init.sh:/scripts/minio-init.sh
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+      MINIO_BUCKET: ${MINIO_BUCKET}
+
+  # -------------------------------------------------------------
+  # JUPYTER — laboratório do aluno, e único lugar onde qualquer dado é
+  # construído neste projeto. Sem pacote pré-instalado nenhum: a
+  # primeira célula do notebook monta um dict `STORAGE_OPTIONS` a partir
+  # das variáveis de ambiente `LAKEHOUSE_S3_*` abaixo, e daí em diante é
+  # só pandas puro (`pd.read_csv`/`df.to_parquet`/`pd.read_parquet`,
+  # via `s3fs`) apontando pro MinIO. Um único notebook,
+  # `investigacao.ipynb` (o mistério — ver README) — lê os CSVs crus de
+  # `dados/`, constrói bronze do zero, e termina publicando a resposta
+  # do caso na silver. Sem pipeline nenhum pronto por trás.
+  #
+  # `command` desliga token e senha (testado: sem isso, mesmo com
+  # JUPYTER_TOKEN="" o servidor gera um token aleatório e pede login),
+  # fixa a interface padrão como o JupyterLab (`/lab`) — já era o
+  # comportamento padrão desta imagem, mas deixamos explícito de
+  # propósito pra não depender de um "padrão" que pode mudar em outra
+  # versão — e restringe a raiz do explorador de arquivos a
+  # `/home/jovyan/notebooks` (`--ServerApp.root_dir`), pra não aparecer
+  # nada além dos notebooks: nem arquivos de configuração do próprio
+  # Jupyter, nem o resto do home do usuário (`/home/jovyan`). Isso só
+  # afeta o que a UI do navegador de arquivos e a API de conteúdo do
+  # Jupyter enxergam — comandos rodados pelo kernel (célula com `!...`,
+  # ou o terminal do JupyterLab) continuam acessando o resto do sistema
+  # de arquivos normalmente. Só faz sentido sem senha porque a porta
+  # 8888 não é exposta pra fora da máquina do aluno — ver README.
+  #
+  # Espera o `minio-init` terminar (bucket + pastas bronze/silver/gold
+  # já existem) antes de subir — senão a primeira célula que tentar
+  # gravar algo no MinIO falharia com "bucket não existe".
+  # -------------------------------------------------------------
+  jupyter:
+    build: ./jupyter
+    container_name: data_lakehouse_101-jupyter
+    command: >
+      start-notebook.sh --ServerApp.token='' --ServerApp.password=''
+      --ServerApp.default_url='/lab' --ServerApp.root_dir='/home/jovyan/notebooks'
+    depends_on:
+      minio-init:
+        condition: service_completed_successfully
+    environment:
+      LAKEHOUSE_S3_ENDPOINT: http://minio:9000
+      LAKEHOUSE_S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      LAKEHOUSE_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+      LAKEHOUSE_S3_BUCKET: ${MINIO_BUCKET}
+    ports:
+      - "8888:8888"
+    volumes:
+      # Bind mount, não copiado pra imagem — editar o notebook (ou
+      # trocar os CSVs em `dados/`) não precisa de rebuild nenhum.
+      - ./jupyter/notebooks:/home/jovyan/notebooks
+
+volumes:
+  minio-data:
